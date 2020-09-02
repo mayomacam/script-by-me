@@ -1,0 +1,2 @@
+cat userpass.txt | awk '{print $2,$4}' | sed 's/"//g' | sed 's/ /:/g' | sponge
+userpass.txt
