@@ -1,0 +1,3 @@
+./ffuf -c -w /usr/share/seclists/Discovery/DNS/subdomains-top1million-110000.txt -u http://sneakycorp.htb/ -H “Host: FUZZ.sneakycorp.htb” -fs 185 -fs is for filter
+./fuff -u "/FUZZ" -w seclist -c -r -v
+./ffuf -w /usr/share/seclists/Usernames/Names/names.txt -u "http://34.74.105.127/858d868c45/login" -X POST -d "username=FUZZ&password=FUZZ" -fw 16
