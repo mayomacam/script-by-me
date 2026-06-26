@@ -39,7 +39,6 @@ RISK_REGEX="${RISK_REGEX:-eval\(|new Function|innerHTML|dangerouslySetInnerHTML|
 
 ACTION=""
 TARGET_URL=""
-TARGETS_FILE=""
 FINDER_INPUT=""
 FINDER_OUTPUT=""
 DUMP_DIR=""
@@ -64,11 +63,27 @@ die() {
   exit 1
 }
 
+# Require that an option was given a value; prints a clean error otherwise.
+# Usage: VAR="$(req_val "$1" "${2:-}")"
+req_val() {
+  [[ -n "${2:-}" ]] || die "$1 requires a value"
+  printf '%s' "$2"
+}
+
+# Absolute path without requiring the path to exist (expands ~ too).
+abspath() {
+  python3 - "$1" <<'PY'
+import os, sys
+print(os.path.abspath(os.path.expanduser(sys.argv[1])))
+PY
+}
+
 usage() {
   cat <<'EOF'
 gittools-kit.sh - authorized GitTools workflow wrapper
 
 USAGE:
+  ./gittools-kit.sh config
   ./gittools-kit.sh init [--config FILE]
   ./gittools-kit.sh finder  --input targets.txt [--output found.txt] [--threads 20] --i-have-authorization
   ./gittools-kit.sh dump    --url https://example.com/.git/ [--dump-dir ./work/dumps/example] --i-have-authorization
@@ -79,7 +94,8 @@ USAGE:
   ./gittools-kit.sh show-config
 
 ACTIONS:
-  init        First-run setup: clone/update GitTools and create config example if missing.
+  init        First-run setup: create config, then clone/update GitTools.
+  config      Create gittools-kit.config and gittools-kit.config.example only; no dependency checks.
   finder      Run GitTools Finder against a file of authorized targets.
   dump        Run GitTools Dumper against one exposed .git URL.
   extract     Run GitTools Extractor against a dumped repository.
@@ -175,52 +191,51 @@ load_config() {
 parse_args() {
   [[ $# -gt 0 ]] || { usage; exit 1; }
 
+  local _v
   while [[ $# -gt 0 ]]; do
     case "$1" in
-      init|finder|dump|dumper|extract|extractor|export|exporter|report|all|show-config|clean)
+      init|config|write-config|finder|dump|dumper|extract|extractor|export|exporter|report|all|show-config|clean)
         ACTION="$1"
         shift
         ;;
       --config)
+        # Value already consumed by load_config; just skip the pair safely.
+        [[ -n "${2:-}" ]] || die "--config requires a file"
         shift 2
         ;;
       --url)
-        TARGET_URL="${2:-}"; shift 2
+        TARGET_URL="$(req_val "$1" "${2:-}")"; shift 2
         ;;
-      --input)
-        FINDER_INPUT="${2:-}"
-        REPORT_INPUT="${2:-}"
-        EXPORT_OUT="${EXPORT_OUT:-}"
-        shift 2
-        ;;
-      --targets-file)
-        TARGETS_FILE="${2:-}"
-        FINDER_INPUT="$TARGETS_FILE"
+      --input|--targets-file)
+        _v="$(req_val "$1" "${2:-}")"
+        FINDER_INPUT="$_v"
+        REPORT_INPUT="$_v"
         shift 2
         ;;
       --output)
-        FINDER_OUTPUT="${2:-}"; shift 2
+        FINDER_OUTPUT="$(req_val "$1" "${2:-}")"; shift 2
         ;;
       --dump-dir)
-        DUMP_DIR="${2:-}"; shift 2
+        DUMP_DIR="$(req_val "$1" "${2:-}")"; shift 2
         ;;
       --out)
-        EXTRACT_OUT="${2:-}"
-        EXPORT_OUT="${2:-}"
+        _v="$(req_val "$1" "${2:-}")"
+        EXTRACT_OUT="$_v"
+        EXPORT_OUT="$_v"
         shift 2
         ;;
       --git-dir)
-        GIT_DIR_NAME="${2:-}"; shift 2
+        GIT_DIR_NAME="$(req_val "$1" "${2:-}")"; shift 2
         ;;
       --threads)
-        FINDER_THREADS="${2:-}"; shift 2
+        FINDER_THREADS="$(req_val "$1" "${2:-}")"; shift 2
         ;;
       --sleep)
-        REQUEST_SLEEP="${2:-}"; shift 2
+        REQUEST_SLEEP="$(req_val "$1" "${2:-}")"; shift 2
         ;;
       --proxy)
-        HTTP_PROXY_URL="${2:-}"
-        HTTPS_PROXY_URL="${2:-}"
+        HTTP_PROXY_URL="$(req_val "$1" "${2:-}")"
+        HTTPS_PROXY_URL="$HTTP_PROXY_URL"
         export HTTP_PROXY="$HTTP_PROXY_URL" HTTPS_PROXY="$HTTPS_PROXY_URL"
         export http_proxy="$HTTP_PROXY_URL" https_proxy="$HTTPS_PROXY_URL"
         shift 2
@@ -247,9 +262,11 @@ parse_args() {
   done
 
   [[ -n "$ACTION" ]] || die "No action provided. Use --help."
-  [[ "$ACTION" == "dumper" ]] && ACTION="dump"
-  [[ "$ACTION" == "extractor" ]] && ACTION="extract"
-  [[ "$ACTION" == "exporter" ]] && ACTION="export"
+  case "$ACTION" in
+    dumper)    ACTION="dump" ;;
+    extractor) ACTION="extract" ;;
+    exporter)  ACTION="export" ;;
+  esac
 }
 
 need_cmd() {
@@ -259,13 +276,15 @@ need_cmd() {
 check_deps() {
   need_cmd bash
   need_cmd git
-  need_cmd curl
   need_cmd sed
   need_cmd grep
   need_cmd awk
   need_cmd find
   need_cmd tar
   need_cmd python3
+  if ! command -v curl >/dev/null 2>&1 && ! command -v wget >/dev/null 2>&1; then
+    die "Missing dependency: need 'curl' or 'wget' (used by GitTools Dumper)."
+  fi
   if ! command -v strings >/dev/null 2>&1; then
     log "WARNING: 'strings' not found. Install binutils for full GitTools compatibility."
   fi
@@ -275,16 +294,17 @@ init_dirs() {
   mkdir -p "$WORK_DIR" "$LOG_DIR" "$REPORT_DIR"
 }
 
-write_config_example() {
+write_config_files() {
+  local config="${SCRIPT_DIR}/gittools-kit.config"
   local example="${SCRIPT_DIR}/gittools-kit.config.example"
-  if [[ -f "$example" && "$FORCE" != "true" ]]; then
-    log "Config example already exists: $example"
-    return
-  fi
 
-  cat > "$example" <<'EOF'
-# gittools-kit.config.example
-# Copy to gittools-kit.config and edit.
+  local config_body
+  config_body="$(cat <<'EOF'
+# gittools-kit.config
+# Main config loaded automatically when kept beside gittools-kit.sh.
+# Override with:
+#   GITTOOLS_KIT_CONFIG=/path/to/config ./gittools-kit.sh show-config
+#   ./gittools-kit.sh --config /path/to/config show-config
 
 # Where upstream GitTools will be cloned/updated
 GITTOOLS_REPO_URL="https://github.com/internetwache/GitTools.git"
@@ -296,9 +316,10 @@ LOG_DIR="$WORK_DIR/logs"
 REPORT_DIR="$WORK_DIR/reports"
 
 # Safety controls
+# Keep true. Each active run then needs --i-have-authorization.
 REQUIRE_AUTH_CONFIRM="true"
 
-# Optional hostname allowlist regex.
+# Strongly recommended: restrict scope to authorized hostnames.
 # Examples:
 #   ALLOWED_HOST_REGEX="(^|\.)example\.com$"
 #   ALLOWED_HOST_REGEX="^(app1|app2)\.example\.com$"
@@ -323,13 +344,29 @@ EXPORT_TAR="true"
 # Keep it broad for first triage, then manually verify results.
 RISK_REGEX="eval\(|new Function|innerHTML|dangerouslySetInnerHTML|localStorage|sessionStorage|document\.cookie|fetch\(|XMLHttpRequest|crypto|AES|RSA|PBKDF2|argon2|bcrypt|jsonwebtoken|jwt|password|passwd|secret|token|api[_-]?key|private[_-]?key|client[_-]?secret|process\.env|env\.|CSP|Content-Security-Policy|iframe|clipboard|window\.location|redirect|cors|csrf|xss|sql injection|nosql"
 EOF
-  log "Wrote config example: $example"
+)"
+
+  if [[ ! -f "$config" || "$FORCE" == "true" ]]; then
+    printf '%s\n' "$config_body" > "$config"
+    chmod 600 "$config" 2>/dev/null || true
+    log "Wrote config: $config"
+  else
+    log "Config already exists, not overwritten: $config"
+  fi
+
+  if [[ ! -f "$example" || "$FORCE" == "true" ]]; then
+    printf '%s\n' "$config_body" | sed 's/^# gittools-kit.config$/# gittools-kit.config.example/' > "$example"
+    chmod 644 "$example" 2>/dev/null || true
+    log "Wrote config example: $example"
+  else
+    log "Config example already exists, not overwritten: $example"
+  fi
 }
 
 init_gittools() {
-  check_deps
   init_dirs
-  write_config_example
+  write_config_files
+  check_deps
 
   if [[ -d "$GITTOOLS_DIR/.git" ]]; then
     log "GitTools exists. Updating: $GITTOOLS_DIR"
@@ -376,7 +413,11 @@ sanitize_name() {
 validate_url() {
   local url="$1"
   [[ "$url" =~ ^https?:// ]] || die "URL must start with http:// or https://"
-  [[ "$url" =~ /\.git/?$ ]] || die "URL should point to exposed .git path, e.g. https://example.com/.git/"
+
+  # gitdumper requires the URL path to end with the git dir name (default .git).
+  local gd_esc
+  gd_esc="$(printf '%s' "$GIT_DIR_NAME" | sed -E 's/[][\\.*^$()+?{}|]/\\&/g')"
+  [[ "$url" =~ /${gd_esc}/?$ ]] || die "URL should point to an exposed ${GIT_DIR_NAME} path, e.g. https://example.com/${GIT_DIR_NAME}/"
 
   local host
   host="$(url_host "$url")"
@@ -387,6 +428,11 @@ validate_url() {
       die "Host '$host' is outside ALLOWED_HOST_REGEX='$ALLOWED_HOST_REGEX'"
     fi
   fi
+}
+
+# gitdumper requires a single trailing slash after the git dir; normalize it.
+normalize_git_url() {
+  printf '%s/' "${1%/}"
 }
 
 validate_targets_file() {
@@ -404,7 +450,10 @@ validate_targets_file() {
         printf '%s\n' "$t"
       fi
     done | head -20)"
-    [[ -z "$bad" ]] || die "Targets outside ALLOWED_HOST_REGEX detected:\n$bad"
+    if [[ -n "$bad" ]]; then
+      printf 'Targets outside ALLOWED_HOST_REGEX detected:\n%s\n' "$bad" >&2
+      die "Refusing to run: out-of-scope targets present in $file"
+    fi
   fi
 }
 
@@ -418,7 +467,7 @@ redact_stream() {
     -e 's#(Authorization:[[:space:]]*Bearer[[:space:]]+)[A-Za-z0-9._~+/=-]+#\1[REDACTED]#Ig' \
     -e 's#(password|passwd|pwd|secret|token|api[_-]?key|client[_-]?secret|private[_-]?key)(["'"'"']?[[:space:]]*[:=][[:space:]]*["'"'"']?)[^"'"'"' ,;}]+#\1\2[REDACTED]#Ig' \
     -e 's#-----BEGIN [A-Z ]*PRIVATE KEY-----.*#-----BEGIN PRIVATE KEY-----[REDACTED]#Ig' \
-    -e 's#([A-Za-z0-9_-]+\.){2}[A-Za-z0-9_-]+#[JWT-LIKE-REDACTED]#g' \
+    -e 's#eyJ[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}\.[A-Za-z0-9_-]{6,}#[JWT-REDACTED]#g' \
     -e 's#(mongodb|mysql|postgres|postgresql|redis)://[^[:space:]'"'"'"]+#\1://[REDACTED]#Ig' \
     -e 's#AKIA[0-9A-Z]{16}#AWS_ACCESS_KEY_ID_REDACTED#g'
 }
@@ -433,6 +482,10 @@ run_finder() {
 
   [[ -n "$FINDER_OUTPUT" ]] || FINDER_OUTPUT="$WORK_DIR/found-git-$(date +%Y%m%d-%H%M%S).txt"
   mkdir -p "$(dirname "$FINDER_OUTPUT")"
+
+  # Resolve to absolute paths; gitfinder.py runs from inside the Finder dir.
+  FINDER_INPUT="$(abspath "$FINDER_INPUT")"
+  FINDER_OUTPUT="$(abspath "$FINDER_OUTPUT")"
 
   log "Running Finder with $FINDER_THREADS threads."
   (
@@ -450,6 +503,7 @@ run_dump() {
 
   [[ -n "$TARGET_URL" ]] || die "dump requires --url https://target/.git/"
   validate_url "$TARGET_URL"
+  TARGET_URL="$(normalize_git_url "$TARGET_URL")"
 
   if [[ -z "$DUMP_DIR" ]]; then
     DUMP_DIR="$WORK_DIR/dumps/$(sanitize_name "$TARGET_URL")"
@@ -582,7 +636,8 @@ run_report() {
   mkdir -p "$REPORT_DIR"
   local base
   base="$(basename "$src")"
-  local report="$REPORT_DIR/${base}-security-report-$(date +%Y%m%d-%H%M%S).md"
+  local report
+  report="$REPORT_DIR/${base}-security-report-$(date +%Y%m%d-%H%M%S).md"
 
   log "Generating report: $report"
 
@@ -610,7 +665,7 @@ run_report() {
     echo "\`\`\`"
     find "$src" -type f \
       \( -iname '.env' -o -iname '*.env' -o -iname '*secret*' -o -iname '*password*' -o -iname '*credential*' -o -iname '*token*' -o -iname '*key*' -o -iname 'id_rsa' -o -iname '*.pem' -o -iname '*.p12' -o -iname '*.pfx' -o -iname 'database.json' -o -iname 'config.json' \) \
-      | sort | redact_stream | head -300
+      | sort | redact_stream | head -300 || true
     echo "\`\`\`"
     echo
     echo "## Risky code/config pattern matches"
@@ -626,7 +681,7 @@ run_report() {
     echo "## Git metadata check"
     echo
     echo "\`\`\`"
-    find "$src" -type d -name '.git' -print | sort | head -100
+    find "$src" -type d -name '.git' -print | sort | head -100 || true
     echo "\`\`\`"
     echo
     echo "## Suggested manual verification"
@@ -666,6 +721,7 @@ run_all() {
   require_authorized
   [[ -n "$TARGET_URL" ]] || die "all requires --url https://target/.git/"
   validate_url "$TARGET_URL"
+  TARGET_URL="$(normalize_git_url "$TARGET_URL")"
 
   local name
   name="$(sanitize_name "$TARGET_URL")"
@@ -707,6 +763,7 @@ main() {
 
   case "$ACTION" in
     init) init_gittools ;;
+    config|write-config) init_dirs; write_config_files ;;
     finder) run_finder ;;
     dump) run_dump ;;
     extract) run_extract ;;
